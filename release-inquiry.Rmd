@@ -1,0 +1,174 @@
+---
+title: "ACLU Jail Release Inquiry"
+author: "Charlotte McClintock"
+date: "February 2019"
+output: 
+  html_document:
+    theme: yeti
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F)
+
+# load libraries
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(knitr)
+
+jail <- read_excel("dsd-release.xlsx")
+```
+
+# Inquiry
+
+Request from ACLU:
+
+>So, we have been hearing reports that Denver takes FOREVER to release people after they have posted bond. We had found a few anecdotal examples of people who got PR bonds but it took them 23-24 hours to be released. El Paso County, in contrast, says that they release people on average within about 2 hours of posting bond. Alarmed, we asked Denver for stats on their release times after someone has posted bond. In a meeting the city attorney told us that on average takes them 6 hours to release someone (that’s still pretty bad). We asked for the underlying data. I have waited about 3 months for the data, which they finally sent over today. As I understand it, Column L is the date when the bond was paid/posted (which starts the clock of when they need to release the person). Column U is the data and time when they were released one of Denver’s two jails (either DJC or COJL). The goal here is to get the difference between these two dates and times. I hope to calculate our own average to see if it lines us with the 6 hours that they reported to us—it would also be great to get average release times for each “reason description” listed (Column T). For example, I see some 100+ day waits for releases to DOC which makes sense because DOC is backlogged. But, I am very concerned about some that I see that are 16 day waits when the person is just released to pretrial services locally—that makes NO sense and is outrageous.
+
+
+# Methodology
+
+I separated the date time variables and reunited them to coerce them to POSIX format, then calculated the time difference in hours.
+
+```{r}
+# clean names
+names(jail) <- str_to_lower(names(jail))
+
+# bail posted date and time
+jail <- separate(jail, `createdatetime from obp`, into = c("day", "month", "year"), sep="-")
+jail <- separate(jail, year, into = c("year", "time", "ampm"), sep=" ", extra = "merge")
+jail <- separate(jail, time, into = c("hour", "minute", "second"), sep="\\.", extra = "drop")
+jail$cent <- "20"
+jail <- unite(jail, "time", hour, minute, second, sep=":")
+jail <- unite(jail, "year", cent, year, sep="")
+jail <- unite(jail, "date", year, month, day, sep='-')
+jail$date <- strptime(jail$date,format="%Y-%b-%d")
+jail <- unite(jail, "bailposteddate", date, time, ampm, sep=" ")
+jail$bailposteddate <-  ymd_hms(jail$bailposteddate)
+
+# release date and time
+jail <- separate(jail, `maxmove_datetime`, into = c("day", "month", "year"), sep="-")
+jail <- separate(jail, year, into = c("year", "time", "ampm"), sep=" ", extra = "merge")
+jail <- separate(jail, time, into = c("hour", "minute", "second"), sep="\\.", extra = "drop")
+jail$cent <- "20"
+jail <- unite(jail, "time", hour, minute, second, sep=":")
+jail <- unite(jail, "year", cent, year, sep="")
+jail <- unite(jail, "date", year, month, day, sep='-')
+jail$date <- strptime(jail$date,format="%Y-%b-%d")
+jail <- unite(jail, "releasedate", date, time, ampm, sep=" ")
+jail$releasedate <-  ymd_hms(jail$releasedate)
+
+# calculate time to release
+jail$releasediff <- with(jail, difftime(releasedate, bailposteddate, units="hours"))
+
+# select relevant variables
+jail <- select(jail, cd, bailposteddate, releasedate, releasediff, race, gender, 
+               `movement reason description`, `release agency`, los)
+
+# remove duplicate observations
+jail <- unique(jail)
+```
+
+This data likely has data quality issues. 12 observations have a release date before the bond posted date. I dropped these negative differences from the overall data. 
+```{r}
+jail.neg <- subset(jail, releasediff<0) %>% select(-c(cd, race, gender, `release agency`)) 
+kable(jail.neg)
+```
+
+Subset the data to specifically focus on release on bond, down to 25331 observations from 29469.
+
+```{r}
+# rename a variable for ease of use.
+jail <- rename(jail, "mvmtreason"="movement reason description")
+# drop anomalous reasons for release, keep bonds
+jail.bond <- subset(jail, mvmtreason=="RELEASED - PR BOND GRANTED"|
+                      mvmtreason=="RELEASED - PRE-TRIAL SERVICES"|
+                      mvmtreason=="RELEASED - BONDED NO CRT ORDERED REST")
+```
+
+How is this distributed? Strongly right skewed, with a high number of lower values.
+
+```{r, fig.width=11}
+ggplot(jail.bond, aes(releasediff, fill=mvmtreason)) + 
+  geom_density(alpha=0.5) + 
+  labs(title="Distribution of Positive Release Times", 
+       x="Time to Release After Bond is Posted", 
+       y="Density", 
+       fill="Reason for Release")
+```
+
+Means for each reason are much higher than medians, pulled up by extreme values. 
+
+```{r}
+kable(jail.bond %>% group_by(mvmtreason) %>% summarise(mean=mean(releasediff), 
+                                                 median=median(releasediff)))
+```
+
+
+How many of these are super high release times? 2572 release times over 48 hours, or about 10% of all cases provided. 
+
+```{r}
+jail.high <- subset(jail.bond, releasediff>=24)
+nrow(jail.high)
+```
+
+
+Do the high release times come from one reason in particular? No, significant numbers in each. 
+```{r}
+jail.high %>% group_by(mvmtreason) %>% count() %>% kable()
+```
+
+What does the distribution look like if we remove release times over 48 hours?
+
+```{r, fig.width=11}
+jail.bond.small <- subset(jail.bond, releasediff>0&releasediff<=48)
+
+# define modal function
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# central tendency measures
+mean(jail.bond.small$releasediff)
+median(jail.bond.small$releasediff)
+getmode(jail.bond.small$releasediff)
+
+ggplot(jail.bond.small, aes(releasediff, fill=mvmtreason)) + 
+  geom_density(alpha=0.5) + 
+  theme(legend.position = "right") +
+  geom_vline(xintercept=1.93, linetype=3) +
+  geom_vline(xintercept=6.68, linetype=3) +
+  geom_vline(xintercept=3.925, linetype=3) +
+  annotate("text", x=1, y=0.025, label="mode: 1.93", angle=90) +
+  annotate("text", x=6, y=0.15, label="mean: 6.68", angle=90) +
+  annotate("text", x=3, y=0.05, label="median: 3.92", angle=90) + 
+  labs(title="Distribution of Release Times Under 48 Hours", 
+       x="Time to Release After Bond is Posted", 
+       y="Density", 
+       fill="Reason for Release")
+```
+
+```{r}
+kable(jail.bond.small %>% group_by(mvmtreason) %>% summarise(mean=mean(releasediff), 
+                                                 median=median(releasediff)))
+```
+
+Are there differences by race or gender?
+
+```{r}
+kable(jail.bond %>% group_by(gender) %>% summarise(mean=mean(releasediff), 
+                                                 median=median(releasediff)))
+
+kable(jail.bond %>% group_by(race) %>% summarise(mean=mean(releasediff), 
+                                                 median=median(releasediff)))
+```
+
+
+Does release time depend on length of stay? (assuming here that los means length of stay)
+
+```{r}
+ggplot(jail.bond, aes(releasediff, los)) + geom_point()
+```
+
+
